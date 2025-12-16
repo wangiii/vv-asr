@@ -218,7 +218,8 @@ def main():
     )
     parser.add_argument(
         "--output-dir", "-o",
-        help="输出目录，保存识别结果到txt文件"
+        default="./output",
+        help="输出目录，保存识别结果到txt文件 (默认: ./output)"
     )
     parser.add_argument(
         "--batch-size", "-b",
