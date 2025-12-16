@@ -1,0 +1,14 @@
+[project]
+name = "my-fun-asr"
+version = "0.1.0"
+description = "ASR工具 - 基于FunAudioLLM/Fun-ASR模型进行语音识别"
+requires-python = ">=3.10"
+dependencies = [
+    "funasr",
+    "torch",
+    "torchaudio",
+    "transformers>=4.57.3",
+]
+
+[project.scripts]
+asr = "asr_tool:main"
