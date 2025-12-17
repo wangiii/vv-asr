@@ -69,7 +69,7 @@ def ensure_qwen_model(model_name: str):
 
 def build_model(model_name: str, device: str, use_vad: bool, vad_max_time: int,
                 use_compile: bool = True, use_half: bool = True):
-    """构建ASR模型"""
+    """构建ASR模型，分离 VAD 模型以获取时间戳"""
     from funasr import AutoModel
 
     # Fun-ASR-Nano 需要额外的 Qwen 模型
@@ -77,34 +77,35 @@ def build_model(model_name: str, device: str, use_vad: bool, vad_max_time: int,
         from funasr.models.fun_asr_nano.model import FunASRNano  # noqa: F401 注册模型类
         ensure_qwen_model(model_name)
 
-    kwargs = {"model": model_name, "device": device, "disable_update": True}
-    if use_vad:
-        kwargs["vad_model"] = "fsmn-vad"
-        kwargs["vad_kwargs"] = {"max_single_segment_time": vad_max_time}
-
     dtype = get_dtype(device) if use_half else torch.float32
     dtype_name = str(dtype).split('.')[-1]
     print(f"加载模型: {model_name} (设备: {device}, 精度: {dtype_name})")
 
-    model = AutoModel(**kwargs)
+    # 分离加载 VAD 和 ASR 模型
+    vad_model = None
+    if use_vad:
+        vad_model = AutoModel(model="fsmn-vad", device=device, disable_update=True)
+        vad_model.vad_max_time = vad_max_time
+
+    asr_model = AutoModel(model=model_name, device=device, disable_update=True)
 
     # 转换为半精度
     if use_half and dtype != torch.float32:
         try:
-            model.model = model.model.to(dtype)
+            asr_model.model = asr_model.model.to(dtype)
             print(f"已转换为 {dtype_name} 精度")
         except Exception as e:
             print(f"半精度转换失败: {e}")
 
-    # torch.compile 优化 (PyTorch 2.0+) - 默认禁用，首次编译太慢
+    # torch.compile 优化 (PyTorch 2.0+)
     if use_compile and hasattr(torch, "compile") and device != "mps":
         try:
-            model.model = torch.compile(model.model, mode="default")
+            asr_model.model = torch.compile(asr_model.model, mode="default")
             print("已启用 torch.compile 优化 (首次运行需要编译)")
         except Exception as e:
             print(f"torch.compile 失败: {e}")
 
-    return model
+    return {"asr": asr_model, "vad": vad_model}
 
 
 def clean_text(text: str) -> list[str]:
@@ -115,29 +116,85 @@ def clean_text(text: str) -> list[str]:
     ]
 
 
-def transcribe(model, audio_path: str, **kwargs) -> dict:
-    """识别单个音频"""
+def resample_audio(waveform, orig_sr: int, target_sr: int = 16000):
+    """重采样音频到目标采样率"""
+    if orig_sr == target_sr:
+        return waveform
+    import librosa
+    return librosa.resample(waveform, orig_sr=orig_sr, target_sr=target_sr)
+
+
+def transcribe(models: dict, audio_path: str, **kwargs) -> dict:
+    """识别单个音频，使用分离的 VAD 和 ASR 模型获取时间戳"""
+    import soundfile as sf
+
     audio = Path(audio_path)
     if not audio.exists():
         raise FileNotFoundError(f"文件不存在: {audio_path}")
 
-    with torch.inference_mode():
-        res = model.generate(input=[audio_path], cache={}, **kwargs)[0]
+    asr_model = models["asr"]
+    vad_model = models.get("vad")
 
-    sentences = clean_text(res.get("text", ""))
-
-    # 构建时间戳段落
     segments = []
-    if sentence_info := res.get("sentence_info"):
-        segments = [
-            {"text": sent, "start": s["start"], "end": s["end"]}
-            for s in sentence_info
-            for sent in clean_text(s["text"])
-        ]
-    elif ts := res.get("timestamp"):
-        segments = [{"text": sent, "start": ts[0][0], "end": ts[-1][1]} for sent in sentences]
+    all_text = []
 
-    return {"text": "\n".join(sentences), "segments": segments}
+    with torch.inference_mode():
+        if vad_model:
+            # 先用 VAD 模型获取语音片段时间戳
+            vad_res = vad_model.generate(input=[audio_path], cache={})[0]
+            vad_segments = vad_res.get("value", [])  # [[start_ms, end_ms], ...]
+
+            if vad_segments:
+                # 读取完整音频
+                waveform, sample_rate = sf.read(audio_path)
+
+                # 重采样到 16kHz (模型要求)
+                target_sr = 16000
+                if sample_rate != target_sr:
+                    waveform = resample_audio(waveform, sample_rate, target_sr)
+                    # 调整时间戳对应的采样点
+                    sample_rate = target_sr
+
+                # 对每个 VAD 片段进行 ASR 识别
+                for seg in vad_segments:
+                    start_ms, end_ms = seg[0], seg[1]
+                    start_sample = int(start_ms * sample_rate / 1000)
+                    end_sample = int(end_ms * sample_rate / 1000)
+
+                    # 提取片段音频
+                    segment_audio = waveform[start_sample:end_sample]
+                    if len(segment_audio) == 0:
+                        continue
+
+                    # 识别片段
+                    res = asr_model.generate(input=[segment_audio], cache={}, **kwargs)[0]
+                    text = res.get("text", "")
+                    cleaned = clean_text(text)
+
+                    for sent in cleaned:
+                        segments.append({"text": sent, "start": start_ms, "end": end_ms})
+                        all_text.append(sent)
+            else:
+                # VAD 没有检测到语音，直接识别整个音频
+                res = asr_model.generate(input=[audio_path], cache={}, **kwargs)[0]
+                all_text = clean_text(res.get("text", ""))
+        else:
+            # 不使用 VAD，直接识别
+            res = asr_model.generate(input=[audio_path], cache={}, **kwargs)[0]
+            text = res.get("text", "")
+            all_text = clean_text(text)
+
+            # 尝试从结果获取时间戳
+            if sentence_info := res.get("sentence_info"):
+                segments = [
+                    {"text": sent, "start": s["start"], "end": s["end"]}
+                    for s in sentence_info
+                    for sent in clean_text(s["text"])
+                ]
+            elif ts := res.get("timestamp"):
+                segments = [{"text": sent, "start": ts[0][0], "end": ts[-1][1]} for sent in all_text]
+
+    return {"text": "\n".join(all_text), "segments": segments}
 
 
 def save_result(result: dict, path: Path):
@@ -178,8 +235,8 @@ def main():
     torch.set_num_threads(num_threads)
     print(f"设备: {device}, CPU线程: {num_threads}")
 
-    model = build_model(args.model, device, not args.no_vad, args.vad_max_time,
-                        use_compile=not args.no_compile, use_half=not args.no_half)
+    models = build_model(args.model, device, not args.no_vad, args.vad_max_time,
+                         use_compile=not args.no_compile, use_half=not args.no_half)
     gen_kwargs = {"batch_size": args.batch_size, "language": args.language, "itn": not args.no_itn}
     if args.hotwords:
         gen_kwargs["hotwords"] = args.hotwords
@@ -187,7 +244,7 @@ def main():
     success, failed = 0, 0
     for audio in args.files:
         try:
-            result = transcribe(model, str(audio), **gen_kwargs)
+            result = transcribe(models, str(audio), **gen_kwargs)
             print(f"\n[{audio}] {result['text']}")
 
             if args.output_dir:
