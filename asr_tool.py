@@ -157,6 +157,59 @@ def resample_audio(waveform, orig_sr: int, target_sr: int = 16000):
     return librosa.resample(waveform, orig_sr=orig_sr, target_sr=target_sr)
 
 
+def load_audio(audio_path: str, target_sr: int = 16000):
+    """
+    加载音频文件，支持多种格式 (m4a, mp4, webm 等)
+
+    优先使用 soundfile 读取，如果格式不支持则通过 ffmpeg 转换。
+
+    Args:
+        audio_path: 音频文件路径
+        target_sr: 目标采样率，默认 16000Hz
+
+    Returns:
+        (waveform, sample_rate): 音频数据和采样率
+    """
+    import soundfile as sf
+    import subprocess
+    import tempfile
+    import numpy as np
+
+    # 首先尝试用 soundfile 直接读取
+    try:
+        waveform, sample_rate = sf.read(audio_path)
+        if sample_rate != target_sr:
+            waveform = resample_audio(waveform, sample_rate, target_sr)
+        return waveform, target_sr
+    except Exception:
+        pass  # soundfile 不支持此格式，尝试 ffmpeg
+
+    # 使用 ffmpeg 转换为 wav 格式
+    # -i: 输入文件
+    # -f wav: 输出格式
+    # -ar: 采样率
+    # -ac 1: 单声道
+    # -acodec pcm_s16le: 16位 PCM 编码
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-ar", str(target_sr), "-ac", "1", "-acodec", "pcm_s16le",
+            "-loglevel", "error", tmp_path
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        waveform, sample_rate = sf.read(tmp_path)
+        return waveform, sample_rate
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg 转换失败: {e.stderr.decode()}") from e
+    except FileNotFoundError:
+        raise RuntimeError("需要安装 ffmpeg 来处理此音频格式") from None
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 # ============================================================
 # 模型构建
 # ============================================================
@@ -236,12 +289,10 @@ def transcribe(models: dict, audio_path: str, **kwargs) -> dict:
 
     处理流程 (启用 VAD 时):
     --------------------------------
-    1. VAD 检测: 找出音频中所有语音片段的时间区间
-       例: [[0, 5000], [7000, 12000]] 表示 0-5秒 和 7-12秒 有语音
+    1. 音频预处理: 加载音频文件 (支持 m4a/mp4/webm 等格式通过 ffmpeg)
 
-    2. 音频预处理:
-       - 读取完整音频文件
-       - 重采样到 16kHz (模型要求)
+    2. VAD 检测: 找出音频中所有语音片段的时间区间
+       例: [[0, 5000], [7000, 12000]] 表示 0-5秒 和 7-12秒 有语音
 
     3. 分段识别: 对每个 VAD 片段:
        - 提取对应时间区间的音频数据
@@ -265,14 +316,16 @@ def transcribe(models: dict, audio_path: str, **kwargs) -> dict:
             ]
         }
     """
-    import soundfile as sf
-
     audio = Path(audio_path)
     if not audio.exists():
         raise FileNotFoundError(f"文件不存在: {audio_path}")
 
     asr_model = models["asr"]
     vad_model = models.get("vad")
+
+    # 预加载音频数据 (支持 m4a/mp4/webm 等格式)
+    target_sr = 16000
+    waveform, sample_rate = load_audio(audio_path, target_sr)
 
     segments = []  # 带时间戳的句子列表
     all_text = []  # 所有句子的纯文本
@@ -281,22 +334,12 @@ def transcribe(models: dict, audio_path: str, **kwargs) -> dict:
         if vad_model:
             # ========== VAD 模式: 分段识别，保留时间戳 ==========
 
-            # Step 1: VAD 检测语音片段
-            vad_res = vad_model.generate(input=[audio_path], cache={})[0]
+            # Step 1: VAD 检测语音片段 (使用预加载的音频数据)
+            vad_res = vad_model.generate(input=[waveform], cache={})[0]
             vad_segments = vad_res.get("value", [])  # [[start_ms, end_ms], ...]
 
             if vad_segments:
-                # Step 2: 读取并预处理音频
-                waveform, sample_rate = sf.read(audio_path)
-
-                # 重采样到 16kHz - 关键步骤!
-                # SenseVoiceSmall 要求 16kHz 输入，其他采样率会导致识别错误
-                target_sr = 16000
-                if sample_rate != target_sr:
-                    waveform = resample_audio(waveform, sample_rate, target_sr)
-                    sample_rate = target_sr
-
-                # Step 3: 对每个 VAD 片段进行 ASR 识别
+                # Step 2: 对每个 VAD 片段进行 ASR 识别
                 for seg in vad_segments:
                     start_ms, end_ms = seg[0], seg[1]
 
@@ -320,11 +363,11 @@ def transcribe(models: dict, audio_path: str, **kwargs) -> dict:
                         all_text.append(sent)
             else:
                 # VAD 没有检测到语音 (可能是静音文件)
-                res = asr_model.generate(input=[audio_path], cache={}, **kwargs)[0]
+                res = asr_model.generate(input=[waveform], cache={}, **kwargs)[0]
                 all_text = clean_text(res.get("text", ""))
         else:
             # ========== 非 VAD 模式: 直接识别整个文件 ==========
-            res = asr_model.generate(input=[audio_path], cache={}, **kwargs)[0]
+            res = asr_model.generate(input=[waveform], cache={}, **kwargs)[0]
             text = res.get("text", "")
             all_text = clean_text(text)
 
